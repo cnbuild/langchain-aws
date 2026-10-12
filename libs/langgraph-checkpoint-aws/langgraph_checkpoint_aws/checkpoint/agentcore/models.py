@@ -1,0 +1,105 @@
+"""
+Data models for AgentCore Memory Checkpoint Saver.
+"""
+
+import hashlib
+import logging
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+class CheckpointerConfig(BaseModel):
+    """Configuration for checkpoint operations."""
+
+    thread_id: str
+    actor_id: str
+    checkpoint_ns: str = ""
+    checkpoint_id: str | None = None
+
+    def _shorten_session_id(self, full_id: str) -> str:
+        """
+        Deterministic shortening: SHA-256 in UTF-8, then hex digest (64 chars).
+
+        Same full_id always yields the same 64-char id [0-9a-f]. No special
+        characters; collision probability is negligible. Used when checkpoint_ns
+        is set to stay under AWS session_id length limit (100 characters).
+        """
+        return hashlib.sha256(full_id.encode()).hexdigest()
+
+    @property
+    def session_id(self) -> str:
+        """Generate session ID from thread_id and checkpoint_ns."""
+        if self.checkpoint_ns:
+            full_id = f"{self.thread_id}_{self.checkpoint_ns}"
+            logger.debug("full_id (thread_id + checkpoint_ns): %s", full_id)
+            return self._shorten_session_id(full_id)
+        return self.thread_id
+
+    @classmethod
+    def from_runnable_config(cls, config: dict[str, Any]) -> "CheckpointerConfig":
+        """Create CheckpointerConfig from RunnableConfig."""
+        from .constants import InvalidConfigError
+
+        configurable = config.get("configurable", {})
+
+        if not configurable.get("thread_id"):
+            raise InvalidConfigError(
+                "RunnableConfig must contain 'thread_id' for AgentCore Checkpointer"
+            )
+
+        if not configurable.get("actor_id"):
+            raise InvalidConfigError(
+                "RunnableConfig must contain 'actor_id' for AgentCore Checkpointer"
+            )
+
+        return cls(
+            thread_id=configurable["thread_id"],
+            actor_id=configurable["actor_id"],
+            checkpoint_ns=configurable.get("checkpoint_ns", ""),
+            checkpoint_id=configurable.get("checkpoint_id"),
+        )
+
+
+class WriteItem(BaseModel):
+    """Individual write operation."""
+
+    task_id: str
+    channel: str
+    value: Any
+    task_path: str = ""
+
+
+class CheckpointEvent(BaseModel):
+    """Event representing a checkpoint."""
+
+    event_type: str = Field(default="checkpoint")
+    checkpoint_id: str
+    checkpoint_data: dict[str, Any]
+    metadata: dict[str, Any]
+    parent_checkpoint_id: str | None = None
+    thread_id: str
+    checkpoint_ns: str = ""
+    snapshot_version: int | None = None
+    chunk_event_ids: list[str] = Field(default_factory=list)
+
+
+class ChannelDataEvent(BaseModel):
+    """Event representing channel data."""
+
+    event_type: str = Field(default="channel_data")
+    channel: str
+    version: str
+    value: Any
+    thread_id: str
+    checkpoint_ns: str = ""
+
+
+class WritesEvent(BaseModel):
+    """Event representing pending writes."""
+
+    event_type: str = Field(default="writes")
+    checkpoint_id: str
+    writes: list[WriteItem]

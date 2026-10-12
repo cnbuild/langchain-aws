@@ -1,0 +1,760 @@
+"""
+Helper classes for AgentCore Memory Checkpoint Saver.
+"""
+
+from __future__ import annotations
+
+import base64
+import datetime
+import json
+import logging
+import time
+import warnings
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Protocol, cast, overload
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langgraph.checkpoint.base import (
+    Checkpoint,
+    CheckpointMetadata,
+    CheckpointTuple,
+    RunnableConfig,
+    SerializerProtocol,
+)
+from langgraph.checkpoint.serde import types as serde_types
+
+from .constants import (
+    EMPTY_CHANNEL_VALUE,
+    EventDecodingError,
+)
+from .models import (
+    ChannelDataEvent,
+    CheckpointerConfig,
+    CheckpointEvent,
+    WriteItem,
+    WritesEvent,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class _DeltaSnapshotProtocol(Protocol):
+    @property
+    def value(self) -> Any: ...
+
+
+# Union type for all events
+EventType = CheckpointEvent | ChannelDataEvent | WritesEvent
+
+
+@dataclass
+class EventReadResult:
+    """Decoded blobs and whether the configured cap left event data unread."""
+
+    events: list[EventType]
+    truncated: bool = False
+
+
+# Default retry configuration
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_INITIAL_BACKOFF = 0.1  # 100ms
+DEFAULT_MAX_BACKOFF = 2.0  # 2 seconds
+
+# AgentCore CreateEvent API limits
+# https://docs.aws.amazon.com/bedrock-agentcore/latest/APIReference/API_CreateEvent.html
+MAX_PAYLOAD_ITEMS_PER_EVENT = 100  # max items in payload array
+MAX_PAYLOAD_BYTES_PER_EVENT = 10_000_000  # 10 MB max event size
+
+
+def merge_client_config(base_config: Config, boto3_kwargs: dict[str, Any]) -> Config:
+    """Handle merging caller-supplied Config into the final boto config."""
+    caller_config: Config | None = boto3_kwargs.pop("config", None)
+    if not isinstance(caller_config, Config):
+        return base_config
+    base_ua = getattr(base_config, "user_agent_extra", "") or ""
+    caller_ua = getattr(caller_config, "user_agent_extra", "") or ""
+    merged = base_config.merge(caller_config)
+    return merged.merge(Config(user_agent_extra=f"{caller_ua} {base_ua}".strip()))
+
+
+class BedrockAgentCoreClientWithRetry:
+    """Wrapper around bedrock-agentcore client with retry logic.
+
+    Automatically retries on RetryableConflictException.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        initial_backoff: float = DEFAULT_INITIAL_BACKOFF,
+        max_backoff: float = DEFAULT_MAX_BACKOFF,
+    ):
+        """Initialize the enhanced client wrapper.
+
+        Args:
+            client: The boto3 bedrock-agentcore client to wrap
+            max_retries: Maximum number of retry attempts for retryable errors
+            initial_backoff: Initial backoff time in seconds for exponential backoff
+            max_backoff: Maximum backoff time in seconds
+        """
+        self._client = client
+        self._max_retries = max_retries
+        self._initial_backoff = initial_backoff
+        self._max_backoff = max_backoff
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy attribute access to the wrapped client."""
+        attr = getattr(self._client, name)
+
+        # If it's the create_event method, wrap it with retry logic
+        if name == "create_event" and callable(attr):
+            return self._create_retryable_method(attr)
+
+        return attr
+
+    def _create_retryable_method(self, method: Any) -> Any:
+        """Create a wrapped version of a method with retry logic.
+
+        Args:
+            method: The method to wrap
+
+        Returns:
+            Wrapped method with retry logic
+        """
+
+        def wrapper(*args, **kwargs):
+            for attempt in range(self._max_retries + 1):
+                try:
+                    return method(*args, **kwargs)
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code")
+                    if error_code == "RetryableConflictException":
+                        if attempt < self._max_retries:
+                            # Calculate sleep time with exponential backoff
+                            sleep_time = min(
+                                self._initial_backoff * (2**attempt),
+                                self._max_backoff,
+                            )
+                            logger.warning(
+                                f"RetryableConflictException encountered on attempt "
+                                f"{attempt + 1}/{self._max_retries + 1}. "
+                                f"Retrying in {sleep_time:.2f}s..."
+                            )
+                            time.sleep(sleep_time)
+                            continue
+                        else:
+                            logger.error(
+                                f"Max retries ({self._max_retries}) exceeded for "
+                                f"RetryableConflictException"
+                            )
+                    raise
+
+            # This should not be reached
+            raise RuntimeError("Unexpected retry loop exit")
+
+        return wrapper
+
+
+class EventSerializer:
+    """Handles serialization and deserialization of events to store in AgentCore Memory."""  # noqa: E501
+
+    def __init__(self, serde: SerializerProtocol):
+        self.serde = serde
+
+    def serialize_value(self, value: Any) -> dict[str, Any]:
+        """Serialize a value using the serde protocol."""
+        type_tag, binary_data = self.serde.dumps_typed(value)
+        return {"type": type_tag, "data": base64.b64encode(binary_data).decode("utf-8")}
+
+    def deserialize_value(self, serialized: dict[str, Any]) -> Any:
+        """Deserialize a value using the serde protocol."""
+        try:
+            type_tag = serialized["type"]
+            binary_data = base64.b64decode(serialized["data"])
+            return self.serde.loads_typed((type_tag, binary_data))
+        except Exception as e:
+            raise EventDecodingError(f"Failed to deserialize value: {e}") from e
+
+    def serialize_event(self, event: EventType) -> str:
+        """Serialize an event to JSON string."""
+
+        # Create a custom serializer for Pydantic models
+        def custom_serializer(obj):
+            if hasattr(obj, "model_dump"):
+                return obj.model_dump()
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+        # Get the base dictionary
+        event_dict = event.model_dump(exclude_none=True)
+
+        # Handle special serialization for specific fields
+        if isinstance(event, CheckpointEvent):
+            event_dict["checkpoint_data"] = self.serialize_value(event.checkpoint_data)
+            event_dict["metadata"] = self.serialize_value(event.metadata)
+
+        elif isinstance(event, ChannelDataEvent):
+            if event.value != EMPTY_CHANNEL_VALUE:
+                event_dict["value"] = self.serialize_value(event.value)
+
+        elif isinstance(event, WritesEvent):
+            event_dict["writes"] = [
+                {
+                    **write.model_dump(exclude_none=True),
+                    "value": self.serialize_value(write.value),
+                }
+                for write in event.writes
+            ]
+
+        return json.dumps(event_dict, default=custom_serializer)
+
+    def deserialize_event(self, data: str) -> EventType:
+        """Deserialize JSON string to event."""
+        try:
+            event_dict = json.loads(data)
+            event_type = event_dict.get("event_type")
+
+            if event_type == "checkpoint":
+                # Deserialize checkpoint data and metadata
+                event_dict["checkpoint_data"] = self.deserialize_value(
+                    event_dict["checkpoint_data"]
+                )
+                event_dict["metadata"] = self.deserialize_value(event_dict["metadata"])
+                return CheckpointEvent(**event_dict)
+
+            elif event_type == "channel_data":
+                # Deserialize channel value if not empty
+                if "value" in event_dict and isinstance(event_dict["value"], dict):
+                    event_dict["value"] = self.deserialize_value(event_dict["value"])
+                return ChannelDataEvent(**event_dict)
+
+            elif event_type == "writes":
+                # Deserialize write values
+                for write in event_dict["writes"]:
+                    if isinstance(write["value"], dict):
+                        write["value"] = self.deserialize_value(write["value"])
+                return WritesEvent(**event_dict)
+
+            else:
+                raise EventDecodingError(f"Unknown event type: {event_type}")
+
+        except json.JSONDecodeError as e:
+            raise EventDecodingError(f"Failed to parse JSON: {e}") from e
+        except Exception as e:
+            raise EventDecodingError(f"Failed to deserialize event: {e}") from e
+
+
+class AgentCoreEventClient:
+    """Handles low-level event storage and retrieval from AgentCore Memory for checkpoints."""  # noqa: E501
+
+    def __init__(
+        self,
+        memory_id: str,
+        serializer: EventSerializer | None = None,
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        initial_backoff: float = DEFAULT_INITIAL_BACKOFF,
+        max_backoff: float = DEFAULT_MAX_BACKOFF,
+        **boto3_kwargs,
+    ):
+        """Initialize the AgentCore event client.
+
+        Args:
+            memory_id: The ID of the AgentCore memory to use
+            serializer: Optional custom event serializer
+            max_retries: Maximum number of retry attempts for retryable errors
+            initial_backoff: Initial backoff time in seconds for exponential backoff
+            max_backoff: Maximum backoff time in seconds
+            **boto3_kwargs: Additional arguments to pass to boto3.client
+        """
+        self.memory_id = memory_id
+        # mypy: need to set actual serializer if None
+        if serializer is None:
+            from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+            self.serializer = EventSerializer(JsonPlusSerializer())
+        else:
+            self.serializer = serializer
+
+        config = merge_client_config(
+            Config(user_agent_extra="x-client-framework:langgraph_agentcore_memory"),
+            boto3_kwargs,
+        )
+        raw_client = boto3.client("bedrock-agentcore", config=config, **boto3_kwargs)
+        self.client = BedrockAgentCoreClientWithRetry(
+            raw_client,
+            max_retries=max_retries,
+            initial_backoff=initial_backoff,
+            max_backoff=max_backoff,
+        )
+
+    def store_blob_event(
+        self, event: EventType, session_id: str, actor_id: str
+    ) -> None:
+        """Store an event in AgentCore Memory."""
+        serialized = self.serializer.serialize_event(event)
+
+        self.client.create_event(
+            memoryId=self.memory_id,
+            actorId=actor_id,
+            sessionId=session_id,
+            eventTimestamp=datetime.datetime.now(datetime.timezone.utc),
+            payload=[{"blob": serialized}],
+        )
+
+    def store_blob_events_batch(
+        self,
+        events: list[EventType],
+        session_id: str,
+        actor_id: str,
+        *,
+        max_payload_items: int = MAX_PAYLOAD_ITEMS_PER_EVENT,
+        max_payload_bytes: int = MAX_PAYLOAD_BYTES_PER_EVENT,
+    ) -> None:
+        """Store multiple events, chunking into multiple API calls if needed.
+
+        AgentCore's ``create_event`` API enforces limits on the payload
+        array (max 100 items) and overall request size (~10 MB).  When the
+        batch exceeds either limit, it is split into the fewest possible
+        chunks that each stay within bounds.
+
+        Args:
+            events: The events to store.
+            session_id: The session ID to store events under.
+            actor_id: The actor ID to store events under.
+            max_payload_items: Maximum number of payload blobs per API call.
+            max_payload_bytes: Maximum total serialized bytes per API call.
+        """
+        blobs = [self.serializer.serialize_event(event) for event in events]
+        chunks = self._chunk_payload(blobs, max_payload_items, max_payload_bytes)
+        timestamp = datetime.datetime.now(datetime.timezone.utc)
+
+        for index, chunk in enumerate(chunks):
+            payload = [{"blob": b} for b in chunk]
+            self.client.create_event(
+                memoryId=self.memory_id,
+                actorId=actor_id,
+                sessionId=session_id,
+                eventTimestamp=timestamp + datetime.timedelta(milliseconds=index),
+                payload=payload,
+            )
+
+    @staticmethod
+    def _chunk_payload(
+        blobs: list[str],
+        max_items: int,
+        max_bytes: int,
+    ) -> list[list[str]]:
+        """Split serialized blobs into chunks respecting item count and byte size.
+
+        Args:
+            blobs: Serialized event strings.
+            max_items: Maximum number of blobs per chunk.
+            max_bytes: Maximum total byte size per chunk.
+
+        Returns:
+            List of chunks, each chunk is a list of blob strings.
+        """
+        if not blobs:
+            return []
+
+        chunks: list[list[str]] = []
+        current_chunk: list[str] = []
+        current_bytes = 0
+
+        for blob in blobs:
+            blob_size = len(blob.encode("utf-8"))
+
+            if current_chunk and (
+                len(current_chunk) >= max_items or current_bytes + blob_size > max_bytes
+            ):
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_bytes = 0
+
+            current_chunk.append(blob)
+            current_bytes += blob_size
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def get_events(
+        self,
+        session_id: str,
+        actor_id: str,
+        limit: int | None = None,
+        max_results: int | None = 100,
+    ) -> list[EventType]:
+        """Retrieve events from AgentCore Memory.
+
+        Args:
+            session_id: The session ID to retrieve events for
+            actor_id: The actor ID to retrieve events for
+            limit: Maximum successfully decoded payload blobs across all pages,
+                or None for no cap. A service event may contain multiple blobs.
+            max_results: Maximum service events per ListEvents page, or None for
+                the service default. Controls page size, not the total read limit.
+
+        Returns:
+            List of retrieved events
+
+        """
+        result = self.read_events(session_id, actor_id, limit, max_results)
+        if result.truncated:
+            warnings.warn(
+                f"Stopped retrieving events at limit of {limit}. "
+                "There may be additional checkpoints that were not retrieved. "
+                "Consider increasing the limit parameter, or set None for no "
+                "limit.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return result.events
+
+    def read_events(
+        self,
+        session_id: str,
+        actor_id: str,
+        limit: int | None = None,
+        max_results: int | None = 100,
+    ) -> EventReadResult:
+        """Read decoded blobs with truncation information for checkpoint validation.
+
+        Args:
+            session_id: Session to read.
+            actor_id: Actor to read.
+            limit: Maximum successfully decoded blobs, or None for no cap.
+            max_results: Service events per page, or None for the service default.
+
+        Returns:
+            Decoded blobs and whether more blobs or another page remain. A
+            truncated result does not establish checkpoint completeness or order.
+        """
+        if (max_results is not None and max_results <= 0) or (
+            limit is not None and limit <= 0
+        ):
+            return EventReadResult([])
+
+        all_events = []
+        next_token = None
+        limit_reached = False
+
+        while True:
+            params = {
+                "memoryId": self.memory_id,
+                "actorId": actor_id,
+                "sessionId": session_id,
+                "includePayloads": True,
+            }
+            if max_results is not None:
+                params["maxResults"] = max_results
+
+            if next_token:
+                params["nextToken"] = next_token
+
+            response = self.client.list_events(**params)
+
+            response_events = response.get("events", [])
+            truncated_page = False
+            for event_index, event in enumerate(response_events):
+                payload = event.get("payload", [])
+                for payload_index, payload_item in enumerate(payload):
+                    blob = payload_item.get("blob")
+                    if blob:
+                        try:
+                            parsed_event = self.serializer.deserialize_event(blob)
+                            all_events.append(parsed_event)
+                        except EventDecodingError as e:
+                            logger.warning(f"Failed to decode event: {e}")
+
+                        if limit is not None and len(all_events) >= limit:
+                            limit_reached = True
+                            truncated_page = any(
+                                item.get("blob")
+                                for item in payload[payload_index + 1 :]
+                            ) or any(
+                                item.get("blob")
+                                for remaining in response_events[event_index + 1 :]
+                                for item in remaining.get("payload", [])
+                            )
+                            break
+
+                if limit_reached:
+                    break
+
+            next_token = response.get("nextToken")
+
+            if limit_reached and (truncated_page or next_token):
+                return EventReadResult(all_events, truncated=True)
+
+            if limit_reached or not next_token:
+                break
+
+        return EventReadResult(all_events)
+
+    def delete_events(self, session_id: str, actor_id: str) -> None:
+        """Delete all events for a session."""
+        params = {
+            "memoryId": self.memory_id,
+            "actorId": actor_id,
+            "sessionId": session_id,
+            "maxResults": 100,
+            "includePayloads": False,
+        }
+
+        while True:
+            response = self.client.list_events(**params)
+            events = response.get("events", [])
+
+            if not events:
+                break
+
+            for event in events:
+                self.client.delete_event(
+                    memoryId=self.memory_id,
+                    sessionId=session_id,
+                    eventId=event["eventId"],
+                    actorId=actor_id,
+                )
+
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+            params["nextToken"] = next_token
+
+
+class EventProcessor:
+    """Processes events into checkpoint data structures."""
+
+    @staticmethod
+    def missing_channel_versions(
+        checkpoint_event: CheckpointEvent,
+        events: list[EventType],
+    ) -> set[tuple[str, str]]:
+        """Find channel references whose blobs were not retrieved."""
+        present = {
+            (event.channel, str(event.version))
+            for event in events
+            if isinstance(event, ChannelDataEvent)
+        }
+        required = {
+            (channel, str(version))
+            for channel, version in checkpoint_event.checkpoint_data.get(
+                "channel_versions", {}
+            ).items()
+        }
+        return required - present
+
+    @staticmethod
+    def process_events(
+        events: list[EventType],
+    ) -> tuple[
+        dict[str, CheckpointEvent],
+        dict[str, list[WriteItem]],
+        dict[tuple[str, str], Any],
+    ]:
+        """Process events into organized data structures."""
+        checkpoints = {}
+        writes_by_checkpoint = defaultdict(list)
+        channel_data_by_version = {}
+
+        for event in events:
+            if isinstance(event, CheckpointEvent):
+                checkpoints[event.checkpoint_id] = event
+
+            elif isinstance(event, WritesEvent):
+                writes_by_checkpoint[event.checkpoint_id].extend(event.writes)
+
+            elif isinstance(event, ChannelDataEvent):
+                if event.value != EMPTY_CHANNEL_VALUE:
+                    channel_data_by_version[(event.channel, event.version)] = (
+                        event.value
+                    )
+
+        return checkpoints, writes_by_checkpoint, channel_data_by_version
+
+    @staticmethod
+    def build_checkpoint_tuple(
+        checkpoint_event: CheckpointEvent,
+        writes: list[WriteItem],
+        channel_data: dict[tuple[str, str], Any],
+        config: CheckpointerConfig,
+    ) -> CheckpointTuple:
+        """Build a CheckpointTuple from processed data."""
+        # Build pending writes
+        pending_writes = [
+            (write.task_id, write.channel, write.value) for write in writes
+        ]
+        # Check if there are interrupts in pending writes
+        has_interrupts = pending_writes and any(
+            write[1] == "__interrupt__" and write[2] for write in pending_writes
+        )
+        # Build parent config
+        parent_config = None
+        if checkpoint_event.parent_checkpoint_id:
+            parent_config = {
+                "configurable": {
+                    "thread_id": config.thread_id,
+                    "actor_id": config.actor_id,
+                    "checkpoint_ns": config.checkpoint_ns,
+                    "checkpoint_id": checkpoint_event.parent_checkpoint_id,
+                }
+            }
+
+        # Build checkpoint with channel values
+        checkpoint = checkpoint_event.checkpoint_data.copy()
+        channel_values = {}
+
+        for channel, version in checkpoint.get("channel_versions", {}).items():
+            if (channel, str(version)) in channel_data:
+                channel_values[channel] = channel_data[(channel, str(version))]
+
+        # Validate if messages are present and no langchain interrupts detected
+        # Then patch orphan tool_calls from messages
+        # This ensures messages loaded from checkpoints are valid for LLM providers
+        if "messages" in channel_values and not has_interrupts:
+            channel_values["messages"] = patch_orphan_tool_calls(
+                channel_values["messages"]
+            )
+
+        checkpoint["channel_values"] = channel_values
+
+        return CheckpointTuple(
+            config={
+                "configurable": {
+                    "thread_id": config.thread_id,
+                    "actor_id": config.actor_id,
+                    "checkpoint_ns": config.checkpoint_ns,
+                    "checkpoint_id": checkpoint_event.checkpoint_id,
+                }
+            },
+            checkpoint=cast(Checkpoint, checkpoint),
+            metadata=cast(CheckpointMetadata, checkpoint_event.metadata),
+            parent_config=cast(RunnableConfig, parent_config)
+            if parent_config
+            else None,
+            pending_writes=pending_writes,
+        )
+
+
+@overload
+def patch_orphan_tool_calls(
+    messages: _DeltaSnapshotProtocol,
+) -> _DeltaSnapshotProtocol: ...
+
+
+@overload
+def patch_orphan_tool_calls(messages: list[Any]) -> list[Any]: ...
+
+
+@overload
+def patch_orphan_tool_calls(messages: None) -> None: ...
+
+
+def patch_orphan_tool_calls(messages: Any) -> Any:
+    """Add placeholder ToolMessages for orphaned tool_calls in AIMessages.
+
+    When a checkpoint is saved mid-tool-execution, there may be AIMessages with
+    tool_calls that don't have corresponding ToolMessages. This would cause
+    Bedrock to throw a ValidationException. This function patches the state by
+    adding placeholder ToolMessages with status="error" for each orphaned tool_call.
+    Delta snapshots are returned unchanged because they are incomplete seeds whose
+    pending writes are replayed later.
+
+    Args:
+        messages: Messages or delta snapshot from checkpoint channel values.
+
+    Returns:
+        The original delta snapshot, or a message list with placeholder `ToolMessage`
+        objects added for orphaned tool calls.
+    """
+    delta_snapshot_type = getattr(serde_types, "_DeltaSnapshot", None)
+    if delta_snapshot_type is not None and isinstance(messages, delta_snapshot_type):
+        return messages
+
+    if not messages:
+        return messages
+
+    patched_messages = []
+
+    for i, msg in enumerate(messages):
+        patched_messages.append(msg)
+
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                tc_id = tool_call.get("id")
+                tc_name = tool_call.get("name", "unknown")
+
+                corresponding_tool_msg = next(
+                    (
+                        m
+                        for m in messages[i + 1 :]
+                        if isinstance(m, ToolMessage) and m.tool_call_id == tc_id
+                    ),
+                    None,
+                )
+
+                if corresponding_tool_msg is None:
+                    logger.warning(
+                        f"Adding placeholder ToolMessage for orphaned tool_call "
+                        f"'{tc_name}' (id: {tc_id}) during checkpoint load"
+                    )
+                    patched_messages.append(
+                        ToolMessage(
+                            content=(
+                                f"Tool call '{tc_name}' with id '{tc_id}' was "
+                                f"interrupted before completion."
+                            ),
+                            name=tc_name,
+                            tool_call_id=tc_id,
+                            status="error",
+                            additional_kwargs={"orphan_tool_call_placeholder": True},
+                        )
+                    )
+
+    return patched_messages
+
+
+def convert_langchain_messages_to_event_messages(
+    messages: list[BaseMessage],
+) -> list[tuple[str, str]]:
+    """Convert LangChain messages to Bedrock Agent Core events
+
+    Args:
+        messages: List of Langchain messages (BaseMessage)
+
+    Returns:
+        List of AgentCore event tuples (text, role)
+    """
+    converted_messages: list[tuple[str, str]] = []
+    for msg in messages:
+        # Skip if event already saved
+        if msg.additional_kwargs.get("event_id") is not None:
+            continue
+
+        text = msg.text
+        if not text.strip():
+            continue
+
+        # Map LangChain roles to Bedrock Agent Core roles
+        if msg.type == "human":
+            role = "USER"
+        elif msg.type == "ai":
+            role = "ASSISTANT"
+        elif msg.type == "tool":
+            role = "TOOL"
+        elif msg.type == "system":
+            role = "OTHER"
+        else:
+            logger.warning(f"Skipping unsupported message type: {msg.type}")
+            continue
+
+        converted_messages.append((text, role))
+
+    return converted_messages

@@ -1,0 +1,222 @@
+# AgentCore Memory Saver
+
+A custom LangChain checkpointer implementation that uses Bedrock AgentCore Memory to enable stateful and resumable LangGraph agents through efficient state persistence and retrieval.
+
+## Overview
+
+This package provides a custom checkpointing solution for LangGraph agents using AWS Bedrock Session Management Service. It enables:
+
+1. Stateful conversations and interactions
+2. Resumable agent sessions
+3. Efficient state persistence and retrieval
+4. Seamless integration with AWS Bedrock
+
+## Installation
+
+You can install the package using pip:
+
+```bash
+pip install langgraph-checkpoint-aws
+```
+
+## Requirements
+
+```text
+Python >=3.10
+langgraph >=1.0.0
+boto3 >=1.43.64
+```
+
+## Usage - Checkpointer
+
+The agent example also requires LangChain and its AWS model integration:
+
+```bash
+pip install -U langchain langchain-aws
+```
+
+```python
+# Import LangGraph and LangChain components
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+
+# Import the AgentCoreMemory integrations
+from langgraph_checkpoint_aws import AgentCoreMemorySaver
+
+REGION = "us-west-2"
+MEMORY_ID = "YOUR_MEMORY_ID"
+MODEL_ID = "us.anthropic.claude-sonnet-5"
+
+# Initialize checkpointer for state persistence. No additional setup required.
+# Sessions will be saved and persisted for actor_id/session_id combinations
+checkpointer = AgentCoreMemorySaver(MEMORY_ID, region_name=REGION)
+
+# Initialize chat model
+model = init_chat_model(MODEL_ID, model_provider="bedrock_converse", region_name=REGION)
+
+# Create a LangChain agent with checkpoint persistence
+agent = create_agent(
+    model=model,
+    tools=[],  # Add tools here if needed
+    checkpointer=checkpointer,  # AgentCoreMemorySaver we created above
+)
+
+# Specify config at runtime for ACTOR and SESSION
+config = {
+    "configurable": {
+        "thread_id": "session-1",  # REQUIRED: This maps to Bedrock AgentCore session_id under the hood
+        "actor_id": "react-agent-1",  # REQUIRED: This maps to Bedrock AgentCore actor_id under the hood
+    }
+}
+
+# Invoke the agent
+response = agent.invoke(
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "I like sushi with tuna. In general seafood is great.",
+            }
+        ]
+    },
+    config=config,
+)
+```
+
+### Snapshot checkpoint_format mode
+
+By default (`checkpoint_format="legacy"`), reading the latest checkpoint scans the whole session, so read latency grows with the number of checkpoints in a thread. `checkpoint_format="snapshot"` stores each checkpoint as a complete snapshot, so the latest checkpoint loads in two `ListEvents` calls regardless of thread length.
+
+```python
+checkpointer = AgentCoreMemorySaver(
+    MEMORY_ID,
+    region_name=REGION,
+    checkpoint_format="snapshot",
+)
+```
+
+Before switching an existing deployment:
+
+- **Switch every worker on a thread together.** Workers on a newer release that use `legacy` will reject snapshot checkpoints with an `InvalidConfigError`. Workers on an older release without this option can't detect them, and will miss pending writes stored by snapshot mode.
+- **Resolve pending interrupts first.** A thread paused at an `interrupt()` when you switch can lose the pending resume.
+- **Switching is a one-way door.** Existing `legacy` threads keep working in `snapshot` mode, but once a thread has a snapshot checkpoint it can't be read in `legacy` mode or by earlier releases.
+- **Leave `limit` unset.** The constructor raises a `ValueError` if `limit` is set with `checkpoint_format="snapshot"`.
+- **Grant `GetEvent` and `ListSessions`.** Snapshot mode needs both; policies written for earlier releases may not include `ListSessions` (see [Required AWS permissions](#required-aws-permissions)).
+
+## Usage - Memory Store
+
+```python
+# Import LangGraph and LangChain components
+from langchain.chat_models import init_chat_model
+from langgraph.prebuilt import create_react_agent
+
+from langgraph_checkpoint_aws import AgentCoreMemoryStore
+
+REGION = "us-west-2"
+MEMORY_ID = "YOUR_MEMORY_ID"
+MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+# Initialize store for saving and searching over long term memories
+# such as preferences and facts across sessions
+store = AgentCoreMemoryStore(MEMORY_ID, region_name=REGION)
+
+
+# Pre-model hook runs and saves messages of your choosing to AgentCore Memory
+# for async processing and extraction
+def pre_model_hook(state, config: RunnableConfig, *, store: BaseStore):
+    """Hook that runs pre-model invocation to save the latest human message"""
+    actor_id = config["configurable"]["actor_id"]
+    thread_id = config["configurable"]["thread_id"]
+
+    # Saving the message to the actor and session combination that we get at runtime
+    namespace = (actor_id, thread_id)
+
+    messages = state.get("messages", [])
+    # Save the last human message we see before model invocation
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            store.put(namespace, str(uuid.uuid4()), {"message": msg})
+            break
+
+    # OPTIONAL: Retrieve user preferences based on the last message and append to state
+    # user_preferences_namespace = ("preferences", actor_id)
+    # preferences = store.search(user_preferences_namespace, query=msg.content, limit=5)
+    # # Add to input messages as needed
+
+    return {"model_input_messages": messages}
+
+
+# Initialize chat model
+model = init_chat_model(MODEL_ID, model_provider="bedrock_converse", region_name=REGION)
+
+# Create a pre-built langgraph agent (configurations work for custom agents too)
+graph = create_react_agent(
+    model=model,
+    tools=[],
+    pre_model_hook=pre_model_hook,
+)
+
+# Specify config at runtime for ACTOR and SESSION
+config = {
+    "configurable": {
+        "thread_id": "session-1",  # REQUIRED: This maps to Bedrock AgentCore session_id under the hood
+        "actor_id": "react-agent-1",  # REQUIRED: This maps to Bedrock AgentCore actor_id under the hood
+    }
+}
+
+# Invoke the agent
+response = graph.invoke(
+    {"messages": [("human", "I like sushi with tuna. In general seafood is great.")]},
+    config=config,
+)
+```
+
+## AWS Configuration
+
+Ensure you have AWS credentials configured using one of these methods:
+
+1. Environment variables
+2. AWS credentials file (~/.aws/credentials)
+3. IAM roles
+4. Direct credential injection via constructor parameters
+
+## Required AWS permissions
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "Statement1",
+            "Effect": "Allow",
+            "Action": [
+                "bedrock-agentcore:CreateEvent",
+                "bedrock-agentcore:ListEvents",
+                "bedrock-agentcore:GetEvent",
+                "bedrock-agentcore:ListSessions",
+                "bedrock-agentcore:DeleteEvent"
+            ],
+            "Resource": [
+                "*"
+            ]
+        }
+    ]
+}
+```
+
+## Security Considerations
+
+* Never commit AWS credentials
+* Use environment variables or AWS IAM roles for authentication
+* Follow AWS security best practices
+* Use IAM roles and temporary credentials when possible
+* Implement proper access controls for session management
+
+## Contributing
+
+See the [contributing guide](https://github.com/langchain-ai/langchain-aws/blob/main/.github/CONTRIBUTING.md) for instructions on how to contribute to this project.
+
+## Acknowledgments
+
+* LangChain team for the base LangGraph framework
+* AWS Bedrock AgentCore team for the memory management service
