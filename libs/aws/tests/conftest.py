@@ -93,3 +93,15 @@ def pytest_recording_configure(config: dict, vcr: VCR) -> None:
     vcr.register_persister(CustomPersister())
     vcr.register_serializer("yaml.gz", CustomSerializer())
     vcr.register_matcher("region_agnostic_uri", region_agnostic_uri_matcher)
+
+def sample_region_agnostic_uri_matcher(r1: Any, r2: Any) -> None:
+    """Match URIs while ignoring the AWS region segment of the endpoint host."""
+    assert _uri_without_aws_region(r1.uri) == _uri_without_aws_region(r2.uri), (
+        f"{r1.uri} != {r2.uri}"
+    )
+
+
+def sample_remove_request_headers(request: Any) -> Any:
+    for k in request.headers:
+        request.headers[k] = "**REDACTED**"
+    return request
